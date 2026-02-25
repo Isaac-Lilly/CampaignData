@@ -3,7 +3,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 import sys
 import time
@@ -11,6 +11,7 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
 # ============================================
 # CONFIGURATION
 # ============================================
@@ -22,7 +23,7 @@ WORKDAY_CONFIG = {
     'token_url': os.getenv('WORKDAY_TOKEN_URL'),
     'api_url': os.getenv('WORKDAY_API_URL'),
     'scope': os.getenv('WORKDAY_SCOPE'),
-    'campaign_start_date': os.getenv('CAMPAIGN_START_DATE', '2026-01-21'),  # Campaign start date for termination filter
+    'campaign_start_date': os.getenv('CAMPAIGN_START_DATE', '2026-01-21'),
 }
 
 # Proofpoint API Configuration - UPDATED WITH BETTER RATE LIMITING
@@ -82,10 +83,11 @@ PROOFPOINT_FIELDS = [
     'Whois ISP',
     'Whois Country',
     'Teachable Moment Started',
-    'Acknowledgement Completed'
+    'Acknowledgement Completed',
+    'False Positive'
 ]
 
-# ✅ CORRECTED FIELD NAMES (GlobalId, SystemLogonId)
+# ✅ UPDATED: Added JobSubFunctionCode and JobSubFunctionDescription
 WORKDAY_FIELDS = [
     'Level5SupervioryOrganizationid',
     'Level5SupervioryOrganizationdesc',
@@ -101,8 +103,8 @@ WORKDAY_FIELDS = [
     'HireDate',
     'InternetEmailAddress',
     'StatusCode',
-    'GlobalId',              # ✅ Changed from GlobalID
-    'SystemLogonId',         # ✅ Changed from SystemLogonID
+    'GlobalId',
+    'SystemLogonId',
     'StatusDescription',
     'Title',
     'WorkCountryDescription',
@@ -110,11 +112,94 @@ WORKDAY_FIELDS = [
     'OnboardDate',
     'RetirementDate',
     'SupervisorEmail',
-    'SupervisorSystemId'
+    'SupervisorSystemId',
+    'JobSubFunctionCode',        # ✅ NEW FIELD
+    'JobSubFunctionDescription'  # ✅ NEW FIELD
 ]
 
 
+# ============================================
+# ✅ HELPER FUNCTIONS FOR FALSE POSITIVE DETECTION
+# ============================================
+
+def parse_timestamp(timestamp_str):
+    """Parse ISO 8601 timestamp to datetime object"""
+    if not timestamp_str or pd.isna(timestamp_str):
+        return None
+    
+    try:
+        if isinstance(timestamp_str, str):
+            # Remove 'Z' if present and parse
+            timestamp_str = timestamp_str.replace('Z', '+00:00')
+            return pd.to_datetime(timestamp_str)
+        return pd.to_datetime(timestamp_str)
+    except Exception as e:
+        print(f"    ⚠️  Error parsing timestamp '{timestamp_str}': {e}")
+        return None
+
+
+def is_false_positive(date_sent, date_clicked, whois_isp):
+    """
+    Determine if a click is a false positive based on:
+    1. Whois ISP contains 'Microsoft Azure'
+    2. Time between sent and clicked <= 60 seconds
+    
+    Returns: True if false positive, False otherwise
+    """
+    # Check if all required data is present
+    if not date_sent or not date_clicked or not whois_isp:
+        return False
+    
+    # Parse timestamps
+    sent_time = parse_timestamp(date_sent)
+    clicked_time = parse_timestamp(date_clicked)
+    
+    if not sent_time or not clicked_time:
+        return False
+    
+    # Check if ISP is Microsoft Azure (case-insensitive)
+    is_azure = 'microsoft azure' in str(whois_isp).lower()
+    
+    # Calculate time difference in seconds
+    time_diff = abs((clicked_time - sent_time).total_seconds())
+    
+    # False positive if Azure AND clicked within 60 seconds
+    is_fp = is_azure and time_diff <= 60
+    
+    if is_fp:
+        print(f"    🔍 False Positive Detected:")
+        print(f"       Date Sent: {date_sent}, Date Clicked: {date_clicked}")
+        print(f"       Time Diff: {time_diff:.2f}s, ISP: {whois_isp}")
+    
+    return is_fp
+
+
+# ✅ NEW HELPER FUNCTION FOR EXECUTIVE LEADERSHIP
+def add_executive_leadership_column(df):
+    """
+    Add 'Executive Leadership' column based on JobSubFunctionCode
+    True if JobSubFunctionCode == 'JFA000011', False otherwise
+    """
+    if 'JobSubFunctionCode' in df.columns:
+        df['Executive Leadership'] = df['JobSubFunctionCode'].apply(
+            lambda x: True if pd.notna(x) and str(x).strip() == 'JFA000011' else False
+        )
+        
+        # Count executives
+        exec_count = df['Executive Leadership'].sum()
+        print(f"  ✅ Executive Leadership column added")
+        print(f"     👔 Executives identified: {exec_count}")
+    else:
+        # If column doesn't exist, default all to False
+        df['Executive Leadership'] = False
+        print("  ⚠️  'JobSubFunctionCode' column not found. All marked as False.")
+    
+    return df
+
+
+# ============================================
 # WORKDAY API FUNCTIONS
+# ============================================
 
 def get_workday_access_token():
     """Get access token for Workday API"""
@@ -138,6 +223,7 @@ def get_workday_access_token():
         print(f"  ❌ Error getting token: {e}")
         raise
 
+
 def fetch_workday_workers():
     """Fetch workers from Workday API - Active OR Terminated on/after campaign start"""
     print("\n📊 Fetching Workday worker data...")
@@ -157,7 +243,6 @@ def fetch_workday_workers():
     select_fields = ','.join(WORKDAY_FIELDS)
 
     while True:
-        # ✅ FIXED: Proper null check for TerminationDate
         filter_query = (
             f"$filter=InternetEmailAddress ne null and "
             f"(StatusDescription eq 'Active' or "
@@ -188,7 +273,10 @@ def fetch_workday_workers():
     print(f"  ✅ Total Workday records: {len(all_records)}\n")
     return all_records
 
+
+# ============================================
 # PROOFPOINT API FUNCTIONS - UPDATED WITH IMPROVED RATE LIMITING
+# ============================================
 
 def fetch_proofpoint_records():
     """Fetch all records from Proofpoint API with improved rate limit handling"""
@@ -285,9 +373,10 @@ def fetch_proofpoint_records():
     print(f"\n  ✅ Total Proofpoint records fetched: {len(all_records)}\n")
     return all_records
 
+
 def transform_proofpoint_data(records):
-    """Transform Proofpoint API data to campaign details - ONLY SPECIFIED FIELDS"""
-    print("🔄 Transforming Proofpoint data...")
+    """✅ Transform Proofpoint API data with FALSE POSITIVE DETECTION"""
+    print("🔄 Transforming Proofpoint data with false positive detection...")
     
     grouped = defaultdict(list)
     for record in records:
@@ -296,6 +385,7 @@ def transform_proofpoint_data(records):
         grouped[key].append(record)
     
     transformed_data = []
+    false_positive_count = 0
     
     for key, events in grouped.items():
         events_sorted = sorted(events, key=lambda x: x['attributes']['eventtimestamp'])
@@ -338,6 +428,20 @@ def transform_proofpoint_data(records):
         def bool_to_str(condition):
             return 'TRUE' if condition else 'FALSE'
         
+        # EXTRACT DATA FOR FALSE POSITIVE CHECK
+        date_sent = first_event.get('senttimestamp')
+        date_clicked = get_first_attr(email_clicks, 'eventtimestamp')
+        whois_isp = whois_source.get('whois_isp')
+        primary_clicked = len(email_clicks) > 0
+        
+        # CHECK FOR FALSE POSITIVE
+        is_fp = is_false_positive(date_sent, date_clicked, whois_isp)
+        
+        # OVERRIDE Primary Clicked if false positive
+        if is_fp:
+            primary_clicked = False
+            false_positive_count += 1
+        
         # ONLY INCLUDE SPECIFIED FIELDS
         record = {
             'Email Address': first_event.get('useremailaddress'),
@@ -347,7 +451,7 @@ def transform_proofpoint_data(records):
             'Users Guid': first_event.get('user_guid'),
             'Campaign Title': first_event.get('campaignname'),
             'Phishing Template': first_event.get('templatename'),
-            'Date Sent': first_event.get('senttimestamp'),
+            'Date Sent': date_sent,
             'Primary Email Opened': bool_to_str(len(email_views) > 0),
             'Date Email Opened': get_first_attr(email_views, 'eventtimestamp'),
             'Multi Email Open': max(0, len(email_views) - 1),
@@ -356,8 +460,8 @@ def transform_proofpoint_data(records):
             'Email Opened Browser Version': get_first_attr(email_views, 'browser_version'),
             'Email Opened OS': get_first_attr(email_views, 'os'),
             'Email Opened OS Version': get_first_attr(email_views, 'os_version'),
-            'Primary Clicked': bool_to_str(len(email_clicks) > 0),
-            'Date Clicked': get_first_attr(email_clicks, 'eventtimestamp'),
+            'Primary Clicked': bool_to_str(primary_clicked),
+            'Date Clicked': date_clicked,
             'Multi Click Event': max(0, len(email_clicks) - 1),
             'Clicked IP Address': get_first_attr(email_clicks, 'ip_address'),
             'Clicked Browser': get_first_attr(email_clicks, 'browser'),
@@ -373,28 +477,39 @@ def transform_proofpoint_data(records):
             'Reported': bool_to_str(len(reported) > 0),
             'Date Reported': get_first_attr(reported, 'eventtimestamp'),
             'Passed?': bool_to_str(not failure_condition),
-            'Whois ISP': whois_source.get('whois_isp'),
+            'Whois ISP': whois_isp,
             'Whois Country': whois_source.get('whois_country'),
             'Teachable Moment Started': bool_to_str(len(tm_sent) > 0),
             'Acknowledgement Completed': bool_to_str(len(tm_complete) > 0),
+            'False Positive': bool_to_str(is_fp),
         }
         
         transformed_data.append(record)
     
-    print(f"  ✅ Transformed {len(transformed_data)} unique records\n")
+    print(f"  ✅ Transformed {len(transformed_data)} unique records")
+    print(f"  🔍 False Positives Detected: {false_positive_count}\n")
     return transformed_data
 
+
+# ============================================
 # MERGE AND EXPORT FUNCTIONS
+# ============================================
 
 def merge_datasets(proofpoint_df, workday_df):
-    """Merge Proofpoint and Workday data on email address - ONLY SPECIFIED FIELDS"""
+    """✅ Merge Proofpoint and Workday data on email address - INCLUDES Executive Leadership"""
     print("🔗 Merging Proofpoint and Workday data...")
     
     # Filter Proofpoint to only specified fields
     proofpoint_df_filtered = proofpoint_df[PROOFPOINT_FIELDS].copy()
     
-    # Filter Workday to only specified fields
-    workday_df_filtered = workday_df[WORKDAY_FIELDS].copy()
+    # ✅ ADD EXECUTIVE LEADERSHIP COLUMN TO WORKDAY DATA BEFORE MERGE
+    workday_df = add_executive_leadership_column(workday_df)
+    
+    # ✅ Update WORKDAY_FIELDS to include Executive Leadership for filtering
+    workday_fields_with_exec = WORKDAY_FIELDS + ['Executive Leadership']
+    
+    # Filter Workday to only specified fields (including Executive Leadership)
+    workday_df_filtered = workday_df[workday_fields_with_exec].copy()
     
     # Normalize email addresses for matching
     proofpoint_df_filtered['Email Address'] = proofpoint_df_filtered['Email Address'].str.lower().str.strip()
@@ -410,15 +525,24 @@ def merge_datasets(proofpoint_df, workday_df):
         suffixes=('_Proofpoint', '_Workday')
     )
     
-    # Remove duplicate InternetEmailAddress column (already have Email Address)
+    # Remove duplicate InternetEmailAddress column
     if 'InternetEmailAddress' in merged_df.columns:
         merged_df = merged_df.drop(columns=['InternetEmailAddress'])
     
     print(f"  ✅ Merged records: {len(merged_df)}")
-    print(f"  ✅ Matched with Workday: {merged_df['GlobalId'].notna().sum()}")  # ✅ Changed GlobalID to GlobalId
-    print(f"  ⚠️  Not matched: {merged_df['GlobalId'].isna().sum()}\n")  # ✅ Changed GlobalID to GlobalId
+    print(f"  ✅ Matched with Workday: {merged_df['GlobalId'].notna().sum()}")
+    print(f"  ⚠️  Not matched: {merged_df['GlobalId'].isna().sum()}")
+    
+    # Count false positives in merged data
+    fp_count = (merged_df['False Positive'] == 'TRUE').sum()
+    print(f"  🔍 False Positives in Merged Data: {fp_count}")
+    
+    # ✅ Count executives in merged data
+    exec_count = merged_df['Executive Leadership'].sum()
+    print(f"  👔 Executives in Merged Data: {exec_count}\n")
     
     return merged_df
+
 
 def export_to_excel_with_sheets(workday_df, proofpoint_df, merged_df, output_path):
     """Export data to Excel with THREE separate sheets"""
@@ -429,7 +553,7 @@ def export_to_excel_with_sheets(workday_df, proofpoint_df, merged_df, output_pat
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Sheet 1: Workday Feed
+            # Sheet 1: Workday Feed (with Executive Leadership column)
             workday_df.to_excel(writer, sheet_name='Workday Feed', index=False)
             print(f"  ✅ Sheet 1: Workday Feed ({len(workday_df)} rows)")
             
@@ -437,7 +561,7 @@ def export_to_excel_with_sheets(workday_df, proofpoint_df, merged_df, output_pat
             proofpoint_df.to_excel(writer, sheet_name='Proofpoint Data', index=False)
             print(f"  ✅ Sheet 2: Proofpoint Data ({len(proofpoint_df)} rows)")
             
-            # Sheet 3: Merged Data
+            # Sheet 3: Merged Data (includes Executive Leadership)
             merged_df.to_excel(writer, sheet_name='Merged Data', index=False)
             print(f"  ✅ Sheet 3: Merged Data ({len(merged_df)} rows)")
             
@@ -470,10 +594,16 @@ def export_to_excel_with_sheets(workday_df, proofpoint_df, merged_df, output_pat
         print(f"  ✅ CSV saved instead: {csv_path}\n")
 
 
+# ============================================
+# MAIN FUNCTION
+# ============================================
+
 def main():
     """Main execution function"""
     print("="*70)
     print("  MERGED PROOFPOINT + WORKDAY CAMPAIGN DETAILS EXPORT")
+    print("  ✅ WITH FALSE POSITIVE DETECTION")
+    print("  ✅ WITH EXECUTIVE LEADERSHIP IDENTIFICATION")
     print("="*70)
     print()
     print(f"📅 Proofpoint Campaign: {PROOFPOINT_CONFIG['start_date']} to {PROOFPOINT_CONFIG['end_date']}")
@@ -482,8 +612,10 @@ def main():
     print(f"⏱️  Rate Limit Delay: {PROOFPOINT_CONFIG['rate_limit_delay']}s between requests")
     print(f"🔄 Retry Delay: {PROOFPOINT_CONFIG['retry_delay']}s after 429 errors")
     print(f"🔁 Max Retries: {PROOFPOINT_CONFIG['max_retries']}")
+    print(f"🔍 False Positive Detection: Microsoft Azure + ≤60s click")
+    print(f"👔 Executive Leadership: JobSubFunctionCode == 'JFA000011'")
     print(f"📊 Proofpoint Fields: {len(PROOFPOINT_FIELDS)}")
-    print(f"📊 Workday Fields: {len(WORKDAY_FIELDS)}")
+    print(f"📊 Workday Fields: {len(WORKDAY_FIELDS)} (+ Executive Leadership)")
     
     if not PROOFPOINT_CONFIG['verify_ssl']:
         print("⚠️  SSL verification is disabled")
@@ -498,19 +630,24 @@ def main():
         if workday_df.empty:
             print("⚠️  No Workday records found")
             # Create empty dataframe with expected columns
-            workday_df = pd.DataFrame(columns=WORKDAY_FIELDS)
+            workday_df = pd.DataFrame(columns=WORKDAY_FIELDS + ['Executive Leadership'])
         else:
             # Clean Workday data
             workday_df = workday_df[workday_df['InternetEmailAddress'].notna()]
             workday_df = workday_df[workday_df['InternetEmailAddress'].str.strip() != '']
             
+            # ✅ ADD EXECUTIVE LEADERSHIP COLUMN
+            workday_df = add_executive_leadership_column(workday_df)
+            
             # Count active vs terminated
             active_count = len(workday_df[workday_df['StatusDescription'] == 'Active'])
             terminated_count = len(workday_df[workday_df['StatusDescription'] != 'Active'])
+            exec_count = workday_df['Executive Leadership'].sum()
             
-            print(f"✅ Total Workday records: {len(workday_df)}")
+            print(f"\n✅ Total Workday records: {len(workday_df)}")
             print(f"   - Active: {active_count}")
-            print(f"   - Terminated (on/after {WORKDAY_CONFIG['campaign_start_date']}): {terminated_count}\n")
+            print(f"   - Terminated (on/after {WORKDAY_CONFIG['campaign_start_date']}): {terminated_count}")
+            print(f"   👔 Executives: {exec_count}\n")
         
         # Step 2: Fetch Proofpoint data
         proofpoint_records = fetch_proofpoint_records()
@@ -523,22 +660,30 @@ def main():
         proofpoint_transformed = transform_proofpoint_data(proofpoint_records)
         proofpoint_df = pd.DataFrame(proofpoint_transformed)
         
-        # Step 4: Merge datasets
+        # Step 4: Merge datasets (Executive Leadership will be included)
         merged_df = merge_datasets(proofpoint_df, workday_df)
         
         # Step 5: Export to Excel with 3 sheets
         export_to_excel_with_sheets(workday_df, proofpoint_df, merged_df, OUTPUT_CONFIG['output_excel'])
         
-        # Summary
+        # ✅ Final Summary
+        fp_count = (proofpoint_df['False Positive'] == 'TRUE').sum()
+        exec_count_workday = workday_df['Executive Leadership'].sum()
+        exec_count_merged = merged_df['Executive Leadership'].sum()
+        
         print()
         print("="*70)
         print("✅ EXPORT COMPLETE")
         print("="*70)
         print(f"📊 Sheet 1 - Workday Feed: {len(workday_df)} records")
+        print(f"   👔 Executives: {exec_count_workday}")
         print(f"📊 Sheet 2 - Proofpoint Data: {len(proofpoint_df)} records")
+        print(f"   🔍 False Positives: {fp_count}")
         print(f"📊 Sheet 3 - Merged Data: {len(merged_df)} records")
-        print(f"   - Matched with Workday: {merged_df['GlobalId'].notna().sum()}")  # ✅ Changed GlobalID to GlobalId
-        print(f"   - Not matched: {merged_df['GlobalId'].isna().sum()}")  # ✅ Changed GlobalID to GlobalId
+        print(f"   - Matched with Workday: {merged_df['GlobalId'].notna().sum()}")
+        print(f"   - Not matched: {merged_df['GlobalId'].isna().sum()}")
+        print(f"   👔 Executives: {exec_count_merged}")
+        print(f"   🔍 False Positives: {(merged_df['False Positive'] == 'TRUE').sum()}")
         print(f"💾 Output: {OUTPUT_CONFIG['output_excel']}")
         print()
         
@@ -551,6 +696,7 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
