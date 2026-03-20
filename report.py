@@ -109,7 +109,7 @@ PROOFPOINT_FIELDS = [
     'False Positive',
 ]
 
-# Added PayGradeLevelCode and PayGradeLevelDescription
+# Added PayGradeLevelCode, PayGradeLevelDescription, FirstName, LastName
 WORKDAY_FIELDS = [
     'Level5SupervioryOrganizationid', 'Level5SupervioryOrganizationdesc',
     'Level6SupervioryOrganizationid', 'Level6SupervioryOrganizationdesc',
@@ -120,7 +120,8 @@ WORKDAY_FIELDS = [
     'StatusDescription', 'Title', 'WorkCountryDescription', 'SupervisorGlobalId',
     'OnboardDate', 'RetirementDate', 'SupervisorEmail', 'SupervisorSystemId',
     'JobSubFunctionCode', 'JobSubFunctionDescription',
-    'PayGradeLevelCode', 'PayGradeLevelDescription',  # NEW
+    'PayGradeLevelCode', 'PayGradeLevelDescription',
+    'FirstName', 'LastName',                                                # NEW
 ]
 
 # ============================================
@@ -258,6 +259,109 @@ def compute_tenure(merged_df: pd.DataFrame, campaign_start_date: str) -> pd.Data
     return merged_df
 
 # ============================================
+# OBFUSCATED EMAIL RESOLUTION
+# ============================================
+
+def resolve_obfuscated_emails(proofpoint_df: pd.DataFrame,
+                               workday_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For every Proofpoint row whose 'Email Address' ends in '@obfuscated.invalid',
+    attempt to find a matching Workday record by (FirstName, LastName) and
+    replace the placeholder with the real InternetEmailAddress from Workday.
+    All other Proofpoint columns remain untouched; the corrected email then
+    joins correctly in the subsequent merge step.
+
+    Matching rules:
+      - Case-insensitive, whitespace-stripped comparison on both name fields.
+      - Exactly ONE Workday match  → replace email, mark resolved.
+      - Zero matches               → log warning, leave placeholder.
+      - Multiple matches           → log warning, leave placeholder (ambiguous).
+
+    Adds column 'Email Resolved From Obfuscated' (TRUE/FALSE) so downstream
+    consumers can identify which rows were resolved this way.
+    """
+    proofpoint_df = proofpoint_df.copy()
+    proofpoint_df['Email Resolved From Obfuscated'] = 'FALSE'
+
+    obfuscated_mask = (
+        proofpoint_df['Email Address']
+        .str.lower()
+        .str.strip()
+        .str.endswith('@obfuscated.invalid', na=False)
+    )
+    obfuscated_rows = proofpoint_df[obfuscated_mask]
+
+    if obfuscated_rows.empty:
+        logger.info("No obfuscated email addresses found in Proofpoint data.")
+        return proofpoint_df
+
+    logger.info("Obfuscated email resolution: %d rows to process.", len(obfuscated_rows))
+
+    # Build a (first_lower, last_lower) → [email, ...] lookup from Workday.
+    # Collecting lists allows ambiguity detection.
+    workday_name_map: dict = defaultdict(list)
+    for _, wd_row in workday_df.iterrows():
+        first = str(wd_row.get('FirstName')  or '').strip().lower()
+        last  = str(wd_row.get('LastName')   or '').strip().lower()
+        email = str(wd_row.get('InternetEmailAddress') or '').strip()
+        if first and last and email:
+            workday_name_map[(first, last)].append(email)
+
+    resolved_count  = 0
+    ambiguous_count = 0
+    notfound_count  = 0
+
+    for idx in obfuscated_rows.index:
+        pp_first   = str(proofpoint_df.at[idx, 'First Name'] or '').strip().lower()
+        pp_last    = str(proofpoint_df.at[idx, 'Last Name']  or '').strip().lower()
+        orig_email = proofpoint_df.at[idx, 'Email Address']
+
+        if not pp_first or not pp_last:
+            logger.warning(
+                "Row %d: obfuscated email '%s' has blank name fields — cannot resolve.",
+                idx, orig_email,
+            )
+            notfound_count += 1
+            continue
+
+        matches = workday_name_map.get((pp_first, pp_last), [])
+
+        if len(matches) == 1:
+            resolved_email = matches[0]
+            proofpoint_df.at[idx, 'Email Address'] = resolved_email
+            proofpoint_df.at[idx, 'Email Resolved From Obfuscated'] = 'TRUE'
+            logger.info(
+                "Row %d: resolved '%s' → '%s'  (name: %s %s)",
+                idx, orig_email, resolved_email,
+                pp_first.title(), pp_last.title(),
+            )
+            resolved_count += 1
+
+        elif len(matches) > 1:
+            logger.warning(
+                "Row %d: obfuscated email '%s' matches %d Workday records for "
+                "'%s %s' — ambiguous, leaving placeholder.",
+                idx, orig_email, len(matches),
+                pp_first.title(), pp_last.title(),
+            )
+            ambiguous_count += 1
+
+        else:
+            logger.warning(
+                "Row %d: obfuscated email '%s' — no Workday record found for "
+                "'%s %s' — leaving placeholder.",
+                idx, orig_email,
+                pp_first.title(), pp_last.title(),
+            )
+            notfound_count += 1
+
+    logger.info(
+        "Obfuscated email resolution complete: resolved=%d ambiguous=%d not_found=%d",
+        resolved_count, ambiguous_count, notfound_count,
+    )
+    return proofpoint_df
+
+# ============================================
 # WORKDAY API
 # ============================================
 
@@ -281,8 +385,8 @@ def get_workday_access_token():
 def fetch_workday_workers():
     """
     Fetch all active or recently-terminated workers from Workday.
-    Pulls WORKDAY_FIELDS including the newly added PayGradeLevelCode
-    and PayGradeLevelDescription columns.
+    Pulls WORKDAY_FIELDS including PayGradeLevelCode, PayGradeLevelDescription,
+    FirstName, and LastName.
     """
     logger.info("Fetching Workday workers...")
     access_token  = get_workday_access_token()
@@ -836,11 +940,14 @@ def enrich_with_splunk_os(merged_df: pd.DataFrame) -> pd.DataFrame:
         for row in rows
         if str(row.get('Email Address') or '').strip()
         and row['_ts_source'] != 'no_action'
+        # Skip still-unresolved obfuscated placeholders — they have no real
+        # identity in Splunk so querying them wastes time and returns nothing.
+        and not str(row.get('Email Address') or '').strip().lower().endswith('@obfuscated.invalid')
     ))
     skipped = len(rows) - len(active_emails)
     logger.info(
         "%d users will be queried in Splunk (failed/reported only) | "
-        "%d skipped (no-action / email-opened-only).",
+        "%d skipped (no-action / email-opened-only / unresolved obfuscated).",
         len(active_emails), skipped,
     )
 
@@ -920,7 +1027,7 @@ def enrich_with_splunk_os(merged_df: pd.DataFrame) -> pd.DataFrame:
             'splunk_ip': '', 'splunk_ts': '', 'splunk_ts_source': '',
         }
 
-        if src != 'no_action':
+        if src != 'no_action' and not email.endswith('@obfuscated.invalid'):
             pf_match = _closest_match(proofpoint.get(email, []), anchor_dt)
             if pf_match:
                 info = {
@@ -970,11 +1077,20 @@ def enrich_with_splunk_os(merged_df: pd.DataFrame) -> pd.DataFrame:
 def merge_datasets(proofpoint_df, workday_df):
     """
     Left-join Proofpoint records to Workday on email address.
-    Workday columns included: all WORKDAY_FIELDS (now including
-    PayGradeLevelCode and PayGradeLevelDescription) plus Executive Leadership.
+    Workday columns included: all WORKDAY_FIELDS (including FirstName, LastName,
+    PayGradeLevelCode, PayGradeLevelDescription) plus Executive Leadership.
+    The 'Email Resolved From Obfuscated' column is carried through if present.
     """
     logger.info("Merging Proofpoint and Workday datasets...")
-    proofpoint_df_filtered = proofpoint_df[PROOFPOINT_FIELDS].copy()
+
+    # Carry through the obfuscated-resolution flag if it was added
+    pp_cols = PROOFPOINT_FIELDS + (
+        ['Email Resolved From Obfuscated']
+        if 'Email Resolved From Obfuscated' in proofpoint_df.columns
+        else []
+    )
+
+    proofpoint_df_filtered = proofpoint_df[pp_cols].copy()
     workday_df             = add_executive_leadership_column(workday_df)
     workday_df_filtered    = workday_df[WORKDAY_FIELDS + ['Executive Leadership']].copy()
 
@@ -999,8 +1115,9 @@ def merge_datasets(proofpoint_df, workday_df):
 def export_to_excel_with_sheets(workday_df, proofpoint_df, merged_df, output_path):
     """
     3-sheet workbook.
-    Workday Feed sheet includes PayGradeLevelCode and PayGradeLevelDescription.
-    Merged Data sheet includes Splunk OS enrichment columns and Tenure.
+    Workday Feed sheet includes PayGradeLevelCode, PayGradeLevelDescription,
+    FirstName, LastName. Merged Data sheet includes Splunk OS enrichment
+    columns, Tenure, and Email Resolved From Obfuscated.
     """
     logger.info("Exporting to Excel (3 sheets)...")
     try:
@@ -1045,7 +1162,7 @@ def main():
     logger.info("=" * 70)
 
     try:
-        # Step 1: Workday (now fetches PayGradeLevelCode + PayGradeLevelDescription)
+        # Step 1: Workday (fetches FirstName, LastName, PayGrade fields, etc.)
         workday_records = fetch_workday_workers()
         workday_df      = pd.DataFrame(workday_records)
         if workday_df.empty:
@@ -1064,22 +1181,28 @@ def main():
         # Step 3: Transform
         proofpoint_df = pd.DataFrame(transform_proofpoint_data(proofpoint_records))
 
-        # Step 4: Merge
+        # Step 4: Resolve obfuscated emails via Workday FirstName / LastName match.
+        # Rows where a unique name match is found have their placeholder email
+        # replaced with the real Workday InternetEmailAddress before the merge,
+        # so all downstream steps (merge, tenure, Splunk) work on the real email.
+        proofpoint_df = resolve_obfuscated_emails(proofpoint_df, workday_df)
+
+        # Step 5: Merge Proofpoint → Workday on email address
         merged_df = merge_datasets(proofpoint_df, workday_df)
 
-        # Step 5: Compute Tenure
-        # Reference date = CAMPAIGN_START_DATE env var (defaults to '2026-01-20').
+        # Step 6: Compute Tenure
+        # Reference date = CAMPAIGN_START_DATE env var.
         # Anchor = ReHireDate if set, else HireDate. Result in decimal years.
         merged_df = compute_tenure(merged_df, WORKDAY_CONFIG['campaign_start_date'])
 
-        # Step 6: Splunk OS enrichment
+        # Step 7: Splunk OS enrichment
         merged_df = enrich_with_splunk_os(merged_df)
 
-        # Step 7: Export Excel
+        # Step 8: Export Excel
         export_to_excel_with_sheets(workday_df, proofpoint_df, merged_df,
                                     OUTPUT_CONFIG['output_excel'])
 
-        # Step 8: Export merged CSV
+        # Step 9: Export merged CSV
         export_merged_to_csv(merged_df, OUTPUT_CONFIG['output_csv'])
 
         # ── Summary ───────────────────────────────────────────────────
@@ -1087,12 +1210,16 @@ def main():
                      if 'Tenure' in merged_df.columns else 0
         splunk_res = int((merged_df.get('splunk_os', pd.Series(dtype=str)) != '').sum()) \
                      if 'splunk_os' in merged_df.columns else 0
+        obfusc_res = int(
+            (proofpoint_df.get('Email Resolved From Obfuscated', pd.Series(dtype=str)) == 'TRUE').sum()
+        ) if 'Email Resolved From Obfuscated' in proofpoint_df.columns else 0
 
         logger.info("=" * 70)
         logger.info("EXPORT COMPLETE")
-        logger.info("Rows         : %d", len(merged_df))
-        logger.info("Tenure resolved : %d", tenure_res)
-        logger.info("Splunk resolved : %d", splunk_res)
+        logger.info("Rows                    : %d", len(merged_df))
+        logger.info("Obfuscated resolved     : %d", obfusc_res)
+        logger.info("Tenure resolved         : %d", tenure_res)
+        logger.info("Splunk resolved         : %d", splunk_res)
         logger.info("Excel: %s", OUTPUT_CONFIG['output_excel'])
         logger.info("CSV:   %s", OUTPUT_CONFIG['output_csv'])
         logger.info("=" * 70)
